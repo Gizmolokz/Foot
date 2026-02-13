@@ -1,0 +1,28 @@
+# Sstats.net - Бесплатное футбольное API (Free football API)
+
+> API SStats.net предоставляет данные о футбольных матчах (статистика, коэффициенты, составы, события и т.д) в формате JSON, csv
+
+Наш сайт предоставляет REST API с документацией по спецификации OpenAPI.
+
+## Форматы данных
+- JSON (по умолчанию)
+- CSV (для табличных данных)
+
+## Доступ
+API документация доступна по стандартному пути OpenAPI. Все эндпоинты поддерживают GET/POST запросы в зависимости от операции.
+
+## Документация
+- [Open API Reference](https://sstats.net/openapi/v1.json): Описание API методов по спецификации Open API 3.0
+- [Quick Start](https://sstats.net/read/post/api-introduction): Руководство по быстрому старту
+- [Получение списка матчей](https://sstats.net/read/post/api-games-list): Извлечение списка матчей. Настройка фильтров
+
+## Дополнительно
+- [FAQ](https://sstats.net/read/faq): Часто задаваемые вопросы
+- [Авторизация](https://sstats.net/read/post/api-auth): Авторизация, доступ с использованием API ключа
+
+## Примеры:
+Список лиг https://api.sstats.net/leagues
+Список матчей сезона: https://api.sstats.net/games/list?LeagueId=41&Year=2023
+Список матчей за сегодня: https://api.sstats.net/games/list?today=true
+Данные матча: https://api.sstats.net/games/1183255
+Данные прогноза Glicko 2 и xG: https://api.sstats.net/games/glicko/1183255
