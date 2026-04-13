@@ -1,0 +1,642 @@
+"""
+Flashscore Fast Parser  —  async версия (максимальная скорость)
+Установка:
+    pip install playwright
+    playwright install chromium
+
+Запуск:
+    python parser_fast.py                       # матчи на сегодня
+    python parser_fast.py --date 2026-04-15     # конкретная дата
+    python parser_fast.py --date 15.04.2026
+    python parser_fast.py --debug
+    python parser_fast.py --visible
+
+Архитектура скорости:
+  • async Playwright — один браузер, параллельные контексты без конфликтов потоков
+  • Предзагрузка URL команд для ВСЕХ матчей пока пользователь читает список
+  • Все 6 статистик (3 матча × 2 команды) загружаются одновременно через asyncio.gather
+"""
+
+import sys
+import asyncio
+from datetime import datetime
+from playwright.async_api import async_playwright, Browser, BrowserContext
+
+DEBUG   = "--debug"   in sys.argv
+VISIBLE = "--visible" in sys.argv
+
+BASE_DOMAIN = "https://www.flashscorekz.com"
+
+TARGET_STAT_NAMES = {
+    "Владение мячом", "Всего ударов", "Удары в створ", "Голевые моменты",
+    "Угловые", "Удары из пределов штрафной", "Удары из-за штрафной",
+    "Касания мяча в штрафной соперника", "Выносы",
+    "Отборы", "Выиграно дуэлей",
+    "Ball Possession", "Total Shots", "Shots on Goal", "Big Chances",
+    "Corner Kicks", "Shots Inside Box", "Shots Outside Box",
+    "Touches in Opposition Box", "Clearances",
+    "Tackles", "Duels Won",
+}
+
+BLOCK_URL_PATTERNS = [
+    "google", "gstatic", "analytics", "gtm", "doubleclick",
+    "syndication", "pagead", "facebook", "twitter", "cdn.cookielaw",
+]
+BLOCK_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".mp4", ".webm", ".mp3", ".ico",
+)
+
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+]
+
+CONTEXT_OPTS = dict(
+    user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+    ),
+    locale="ru-RU",
+    viewport={"width": 1280, "height": 800},
+)
+
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver',          { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins',            { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages',          { get: () => ['ru-RU','ru','en-US','en'] });
+    Object.defineProperty(navigator, 'platform',           { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'hardwareConcurrency',{ get: () => 8 });
+    window.chrome = { runtime: {} };
+    const _getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return _getParam.call(this, p);
+    };
+"""
+
+BANNER_SELECTORS = [
+    "text=IK BEN 24 EN OUDER", "text=24 EN OUDER",
+    "text=I'M 18 OR OLDER",    "text=I AM 18 OR OLDER",
+    "text=ACCEPT & CLOSE",     "text=Accept", "text=Принять",
+    "[id*='onetrust-accept']",
+    "[class*='age-gate'] button:first-child",
+    "[class*='ageGate'] button:first-child",
+    "[class*='consent'] button:first-child",
+]
+
+STATS_TAB_SELECTORS = [
+    "a[href*='match-statistics']", "[class*='statistics']",
+    "text=Статистика матча", "text=Match Statistics",
+    "text=Статистика",       "text=Statistics",
+]
+
+MATCH_SECTION_NAMES = {"Матч", "Match"}
+
+
+# ---------------------------------------------------------------------------
+# Resource blocking (async)
+# ---------------------------------------------------------------------------
+
+async def block_resources(route, request):
+    url = request.url
+    if any(p in url for p in BLOCK_URL_PATTERNS):
+        await route.abort()
+        return
+    if any(url.split("?")[0].endswith(ext) for ext in BLOCK_EXTENSIONS):
+        await route.abort()
+        return
+    await route.continue_()
+
+
+# ---------------------------------------------------------------------------
+# Context factory
+# ---------------------------------------------------------------------------
+
+async def new_ctx(browser: Browser):
+    """Create a stealth browser context + page."""
+    ctx = await browser.new_context(**CONTEXT_OPTS)
+    await ctx.add_init_script(STEALTH_SCRIPT)
+    page = await ctx.new_page()
+    return ctx, page
+
+
+# ---------------------------------------------------------------------------
+# Feed parsing  (pure Python — synchronous, no Playwright calls)
+# ---------------------------------------------------------------------------
+
+def parse_feed(raw: str):
+    records = []
+    for block in raw.split("~"):
+        block = block.strip()
+        if not block:
+            continue
+        record = {}
+        for pair in block.split("¬"):
+            if "÷" in pair:
+                k, _, v = pair.partition("÷")
+                record[k.strip()] = v.strip()
+        if record:
+            records.append(record)
+    return records
+
+
+def parse_matches_from_feed(raw: str):
+    records = parse_feed(raw)
+    matches, seen_ids = [], set()
+    for r in records:
+        match_id  = r.get("AA", "")
+        timestamp = r.get("AD", "")
+        if not match_id or not timestamp:
+            continue
+        if len(match_id) < 5 or not timestamp.isdigit():
+            continue
+        if match_id in seen_ids:
+            continue
+        seen_ids.add(match_id)
+        try:
+            dt = datetime.fromtimestamp(int(timestamp)).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            dt = timestamp
+        home_score = r.get("AG", r.get("WM", ""))
+        away_score = r.get("AH", r.get("WN", ""))
+        matches.append({
+            "match_id":   match_id,
+            "date":       dt,
+            "home_team":  r.get("CX", r.get("WU", r.get("EW", ""))),
+            "away_team":  r.get("AF", r.get("WV", r.get("EX", ""))),
+            "home_score": home_score or "-",
+            "away_score": away_score or "-",
+            "league":     r.get("CL", r.get("AL", "")),
+        })
+    return matches
+
+
+def parse_stats_from_feed(raw: str):
+    records = parse_feed(raw)
+    stats, seen_names, in_match = [], set(), False
+    for r in records:
+        if "SE" in r:
+            in_match = r.get("SE", "").strip() in MATCH_SECTION_NAMES
+            continue
+        if not in_match:
+            continue
+        if "SF" in r and not r.get("SG"):
+            continue
+        name = r.get("SG", "")
+        home = r.get("SH", "")
+        away = r.get("SI", "")
+        if name and home and away and name not in seen_names:
+            seen_names.add(name)
+            stats.append({
+                "name":      name,
+                "home":      home,
+                "away":      away,
+                "is_target": name in TARGET_STAT_NAMES,
+            })
+    return stats
+
+
+def merge_stats(stats_list):
+    merged, seen = [], set()
+    for stats in stats_list:
+        for s in stats:
+            if s["name"] not in seen:
+                seen.add(s["name"])
+                merged.append(s)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Page helpers (async)
+# ---------------------------------------------------------------------------
+
+async def dismiss_banners(page):
+    for sel in BANNER_SELECTORS:
+        try:
+            await page.click(sel, timeout=400)
+            await page.wait_for_timeout(200)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def try_click_stats_tab(page):
+    for sel in STATS_TAB_SELECTORS:
+        try:
+            await page.click(sel, timeout=1500)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Core fetch coroutines  (each creates its own context)
+# ---------------------------------------------------------------------------
+
+async def fetch_day_matches(browser: Browser, date_str: str = "") -> list:
+    raw_bodies, seen_keys = [], set()
+
+    def on_response(response):
+        async def _read():
+            try:
+                body = await response.body()
+                text = body.decode("utf-8", errors="replace")
+                key  = text[:80]
+                if key in seen_keys or len(text) < 100:
+                    return
+                seen_keys.add(key)
+                if "AA÷" in text:
+                    raw_bodies.append(text)
+                    if DEBUG:
+                        print("[DEBUG] Day feed: {}".format(response.url))
+            except Exception:
+                pass
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto("{}/football/".format(BASE_DOMAIN),
+                        wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+        if date_str:
+            await page.evaluate("window.location.hash = '/{}'".format(date_str))
+            await page.wait_for_timeout(1500)
+
+        for _ in range(60):
+            await page.wait_for_timeout(250)
+            if raw_bodies:
+                await page.wait_for_timeout(800)
+                break
+    finally:
+        await ctx.close()
+
+    all_matches, seen_ids = [], set()
+    for body in raw_bodies:
+        for m in parse_matches_from_feed(body):
+            if m["match_id"] not in seen_ids:
+                seen_ids.add(m["match_id"])
+                all_matches.append(m)
+    all_matches.sort(key=lambda m: m["date"])
+    return all_matches
+
+
+async def fetch_team_urls(browser: Browser, match_id: str) -> list:
+    """
+    Return [(team_id, results_url), ...] for both teams.
+    Intercepts the earliest API feed that contains team slugs/IDs —
+    typically arrives well before the full DOM is ready.
+    Falls back to DOM parsing if the feed approach yields nothing.
+    """
+    url = "{}/match/{}/".format(BASE_DOMAIN, match_id)
+    found: list = []          # filled by response handler as soon as data arrives
+    ready = asyncio.Event()   # set when we have both team entries
+
+    def _extract_from_text(text: str) -> list:
+        """Parse team slug + ID pairs from a Flashscore feed body."""
+        entries, seen = [], set()
+        for token in text.split("¬"):
+            if "÷" not in token:
+                continue
+            _, _, val = token.partition("÷")
+            # Team URLs appear as /team/slug/id/ inside href values in feed
+            if "/team/" in val:
+                parts = [p for p in val.strip("/").split("/") if p]
+                idx = next((i for i, p in enumerate(parts) if p == "team"), None)
+                if idx is not None and idx + 2 < len(parts):
+                    slug = parts[idx + 1]
+                    tid  = parts[idx + 2]
+                    ru = "{}/team/{}/{}/results/".format(BASE_DOMAIN, slug, tid)
+                    if ru not in seen:
+                        seen.add(ru)
+                        entries.append((tid, ru))
+        return entries
+
+    def on_response(response):
+        async def _read():
+            if ready.is_set():
+                return
+            try:
+                body = await response.body()
+                text = body.decode("utf-8", errors="replace")
+                if "team" not in text or len(text) < 50:
+                    return
+                entries = _extract_from_text(text)
+                if len(entries) >= 2:
+                    found.extend(entries[:2])
+                    ready.set()
+                    if DEBUG:
+                        print("[DEBUG] Team URLs from feed: {}".format(response.url))
+            except Exception:
+                pass
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+
+        # Wait up to 3 s for feed-based result; if not, parse DOM immediately
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+
+        if len(found) < 2:
+            # Fallback: query DOM for team links
+            try:
+                await page.wait_for_selector("a[href*='/team/']", timeout=3000)
+            except Exception:
+                pass
+            seen_dom: set = set()
+            for link in await page.query_selector_all("a[href*='/team/']"):
+                href  = await link.get_attribute("href") or ""
+                parts = [p for p in href.strip("/").split("/") if p]
+                if len(parts) >= 3 and parts[0] == "team":
+                    results_url = "{}/team/{}/{}/results/".format(
+                        BASE_DOMAIN, parts[1], parts[2])
+                    if results_url not in seen_dom:
+                        seen_dom.add(results_url)
+                        found.append((parts[2], results_url))
+                        if DEBUG:
+                            print("[DEBUG] Team URL (DOM): {}".format(results_url))
+                if len(found) >= 2:
+                    break
+
+    except Exception as e:
+        if DEBUG:
+            print("[DEBUG] fetch_team_urls error: {}".format(e))
+    finally:
+        await ctx.close()
+
+    return found[:2]
+
+
+async def fetch_team_recent_matches(browser: Browser, team_id: str,
+                                    results_url: str, count: int = 3) -> list:
+    """Return last `count` match dicts for a team."""
+    patterns = [
+        "tr_1_{}".format(team_id), "tr_4_{}".format(team_id),
+        "tr_2_{}".format(team_id), team_id,
+    ]
+    captured = {}
+
+    def on_response(response):
+        async def _read():
+            for pat in patterns:
+                if pat in response.url:
+                    try:
+                        body = await response.body()
+                        text = body.decode("utf-8", errors="replace")
+                        if text and text.strip() not in ("0", ""):
+                            captured[pat] = text
+                            if DEBUG:
+                                print("[DEBUG] Results '{}': {}".format(pat, response.url))
+                    except Exception:
+                        pass
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto(results_url, wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+        for _ in range(40):
+            await page.wait_for_timeout(250)
+            if any(captured.values()):
+                break
+    finally:
+        await ctx.close()
+
+    for body in captured.values():
+        matches = parse_matches_from_feed(body)
+        if matches:
+            return matches[:count]
+    return []
+
+
+async def fetch_match_stats(browser: Browser, match_id: str) -> list:
+    """Return stats list for one historical match."""
+    url = "{}/match/{}/".format(BASE_DOMAIN, match_id)
+    raw_bodies = []
+
+    def on_response(response):
+        async def _read():
+            resp_url = response.url
+            if match_id in resp_url or "dc_1_" in resp_url:
+                try:
+                    body = await response.body()
+                    text = body.decode("utf-8", errors="replace")
+                    if text and text.strip() not in ("0", "") and "SG÷" in text:
+                        raw_bodies.append(text)
+                        if DEBUG:
+                            print("[DEBUG] Stats #{} from: {}".format(
+                                len(raw_bodies), resp_url))
+                except Exception:
+                    pass
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        # Try tab click immediately — no fixed wait before first attempt
+        await dismiss_banners(page)
+        clicked = await try_click_stats_tab(page)
+
+        for attempt in range(40):
+            await page.wait_for_timeout(200)
+            if raw_bodies:
+                break
+            if not clicked:
+                await dismiss_banners(page)
+                clicked = await try_click_stats_tab(page)
+    finally:
+        await ctx.close()
+
+    if DEBUG and not raw_bodies:
+        print("[DEBUG] No stats for match {}".format(match_id))
+
+    return merge_stats([parse_stats_from_feed(b) for b in raw_bodies]) if raw_bodies else []
+
+
+# ---------------------------------------------------------------------------
+# High-level orchestration
+# ---------------------------------------------------------------------------
+
+async def get_full_stats_for_match(browser: Browser, match_id: str,
+                                   team_names: list) -> dict:
+    """
+    1. Get team URLs for selected match
+    2. Get last 3 matches for BOTH teams — parallel
+    3. Start fetching stats for each team's matches THE MOMENT their results
+       arrive — don't wait for both teams before starting stats (pipeline).
+    """
+    # ── 1. Team URLs ─────────────────────────────────────────────────────────
+    team_entries = await fetch_team_urls(browser, match_id)
+
+    if len(team_entries) < 2:
+        return {n: [] for n in team_names}
+
+    (home_id, home_url), (away_id, away_url) = team_entries[0], team_entries[1]
+    results = {team_names[0]: [], team_names[1]: []}
+
+    # ── 2+3. Pipeline: start stats fetch as soon as each team's results arrive ─
+    async def process_team(team_id, team_url, label):
+        matches = await fetch_team_recent_matches(browser, team_id, team_url)
+        if not matches:
+            return
+
+        # Start all stats for this team immediately — parallel
+        stat_tasks = [
+            asyncio.ensure_future(fetch_match_stats(browser, m["match_id"]))
+            for m in matches
+        ]
+        stat_results = await asyncio.gather(*stat_tasks, return_exceptions=True)
+
+        for m, stats in zip(matches, stat_results):
+            if isinstance(stats, Exception):
+                if DEBUG:
+                    print("[DEBUG] Stats error {}: {}".format(m["match_id"], stats))
+                stats = []
+            results[label].append({"match": m, "stats": stats})
+
+    # Both teams processed in parallel — each starts its own stats pipeline
+    await asyncio.gather(
+        process_team(home_id, home_url, team_names[0]),
+        process_team(away_id, away_url, team_names[1]),
+    )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_stats(stats):
+    if not stats:
+        print("    Статистика недоступна.")
+        return
+    filtered = [s for s in stats if s["is_target"]]
+    to_show  = filtered if filtered else stats
+    print("    {:<42} {:^14} {:^14}".format("Показатель", "Хозяева", "Гости"))
+    print("    " + "-" * 72)
+    for s in to_show:
+        print("    {:<42} {:^14} {:^14}".format(s["name"], s["home"], s["away"]))
+
+
+def print_team_data(team_name, team_data):
+    print("\n" + "=" * 76)
+    print("  Команда: {}".format(team_name))
+    print("=" * 76)
+    if not team_data:
+        print("  Матчи не найдены.")
+        return
+    for i, item in enumerate(team_data, 1):
+        m     = item["match"]
+        score = "{}:{}".format(m["home_score"], m["away_score"])
+        league = "  [{}]".format(m["league"]) if m["league"] else ""
+        print("\n" + "-" * 76)
+        print("  Матч {}: {}  {}  {}".format(
+            i, m["home_team"] or "—", score, m["away_team"] or "—"))
+        print("  Дата: {}{}".format(m["date"], league))
+        print_stats(item["stats"])
+    print("\n" + "=" * 76)
+
+
+# ---------------------------------------------------------------------------
+# Date resolution (no manual input)
+# ---------------------------------------------------------------------------
+
+def resolve_date_arg():
+    today = datetime.today()
+    for i, arg in enumerate(sys.argv):
+        if arg == "--date" and i + 1 < len(sys.argv):
+            raw = sys.argv[i + 1].strip()
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    return dt.strftime("%Y-%m-%d"), dt.strftime("%d.%m.%Y")
+                except ValueError:
+                    continue
+            print("Неверный формат --date (ожидается YYYY-MM-DD или DD.MM.YYYY).")
+    return "", today.strftime("%d.%m.%Y")
+
+
+# ---------------------------------------------------------------------------
+# Main (async entry point)
+# ---------------------------------------------------------------------------
+
+async def main():
+    date_str, display_date = resolve_date_arg()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=not VISIBLE, args=LAUNCH_ARGS)
+
+        try:
+            # ── Шаг 1: матчи на день ─────────────────────────────────────────
+            print("\nЗагрузка матчей на {}...".format(display_date))
+            day_matches = await fetch_day_matches(browser, date_str)
+
+            if not day_matches:
+                print("Матчи не найдены. Попробуйте --debug.")
+                return
+
+            # ── Шаг 2: показ списка ──────────────────────────────────────────
+            print("\n  {:<4} {:<7} {:<32} {:<32} {}".format(
+                "#", "Время", "Хозяева", "Гости", "Лига"))
+            print("  " + "-" * 92)
+            for i, m in enumerate(day_matches, 1):
+                time_part = m["date"].split(" ")[1] if " " in m["date"] else m["date"]
+                score = ""
+                if m["home_score"] != "-" and m["away_score"] != "-":
+                    score = " ({}:{})".format(m["home_score"], m["away_score"])
+                home   = (m["home_team"] + score)[:32]
+                away   = m["away_team"][:32]
+                league = m["league"][:26] if m["league"] else ""
+                print("  {:<4} {:<7} {:<32} {:<32} {}".format(
+                    i, time_part, home, away, league))
+
+            # ── Шаг 4: выбор матча (единственный ввод) ──────────────────────
+            print("\nВыберите матч (1–{}):".format(len(day_matches)))
+            try:
+                choice = int(input("> ").strip())
+                assert 1 <= choice <= len(day_matches)
+            except (ValueError, AssertionError, EOFError):
+                print("Неверный выбор.")
+                return
+
+            selected    = day_matches[choice - 1]
+            team_names  = [selected["home_team"], selected["away_team"]]
+            print("\nВыбран: {}  vs  {}  ({})".format(
+                selected["home_team"], selected["away_team"], selected["date"]))
+            print("Загрузка статистики...")
+
+            # ── Шаг 5: получить данные только для выбранного матча ───────────
+            results = await get_full_stats_for_match(
+                browser, selected["match_id"], team_names
+            )
+
+        finally:
+            await browser.close()
+
+    # ── Шаг 7: вывод ─────────────────────────────────────────────────────────
+    for team_name in team_names:
+        print_team_data(team_name, results.get(team_name, []))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
