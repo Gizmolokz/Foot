@@ -31,11 +31,13 @@ TARGET_STAT_NAMES = {
     "Владение мячом", "Всего ударов", "Удары в створ", "Голевые моменты",
     "Угловые", "Удары из пределов штрафной", "Удары из-за штрафной",
     "Касания мяча в штрафной соперника", "Выносы",
-    "Отборы", "Выиграно дуэлей",
+    "Отборы", "Отборы (%)", "Отборы %", "Успешные отборы",
+    "Выиграно дуэлей", "Дуэли", "Выиграно единоборств",
     "Ball Possession", "Total Shots", "Shots on Goal", "Big Chances",
     "Corner Kicks", "Shots Inside Box", "Shots Outside Box",
     "Touches in Opposition Box", "Clearances",
-    "Tackles", "Duels Won",
+    "Tackles", "Tackles (%)", "Tackles %", "Successful Tackles",
+    "Duels Won", "Duels", "Duel Success",
 }
 
 BLOCK_URL_PATTERNS = [
@@ -289,96 +291,37 @@ async def fetch_day_matches(browser: Browser, date_str: str = "") -> list:
 
 
 async def fetch_team_urls(browser: Browser, match_id: str) -> list:
-    """
-    Return [(team_id, results_url), ...] for both teams.
-    Intercepts the earliest API feed that contains team slugs/IDs —
-    typically arrives well before the full DOM is ready.
-    Falls back to DOM parsing if the feed approach yields nothing.
-    """
+    """Return [(team_id, results_url), ...] for both teams of a match."""
     url = "{}/match/{}/".format(BASE_DOMAIN, match_id)
-    found: list = []          # filled by response handler as soon as data arrives
-    ready = asyncio.Event()   # set when we have both team entries
-
-    def _extract_from_text(text: str) -> list:
-        """Parse team slug + ID pairs from a Flashscore feed body."""
-        entries, seen = [], set()
-        for token in text.split("¬"):
-            if "÷" not in token:
-                continue
-            _, _, val = token.partition("÷")
-            # Team URLs appear as /team/slug/id/ inside href values in feed
-            if "/team/" in val:
-                parts = [p for p in val.strip("/").split("/") if p]
-                idx = next((i for i, p in enumerate(parts) if p == "team"), None)
-                if idx is not None and idx + 2 < len(parts):
-                    slug = parts[idx + 1]
-                    tid  = parts[idx + 2]
-                    ru = "{}/team/{}/{}/results/".format(BASE_DOMAIN, slug, tid)
-                    if ru not in seen:
-                        seen.add(ru)
-                        entries.append((tid, ru))
-        return entries
-
-    def on_response(response):
-        async def _read():
-            if ready.is_set():
-                return
-            try:
-                body = await response.body()
-                text = body.decode("utf-8", errors="replace")
-                if "team" not in text or len(text) < 50:
-                    return
-                entries = _extract_from_text(text)
-                if len(entries) >= 2:
-                    found.extend(entries[:2])
-                    ready.set()
-                    if DEBUG:
-                        print("[DEBUG] Team URLs from feed: {}".format(response.url))
-            except Exception:
-                pass
-        asyncio.ensure_future(_read())
-
     ctx, page = await new_ctx(browser)
     try:
         await page.route("**/*", block_resources)
-        page.on("response", on_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await dismiss_banners(page)
+        await page.wait_for_timeout(1000)
 
-        # Wait up to 3 s for feed-based result; if not, parse DOM immediately
-        try:
-            await asyncio.wait_for(ready.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
-            pass
-
-        if len(found) < 2:
-            # Fallback: query DOM for team links
-            try:
-                await page.wait_for_selector("a[href*='/team/']", timeout=3000)
-            except Exception:
-                pass
-            seen_dom: set = set()
-            for link in await page.query_selector_all("a[href*='/team/']"):
-                href  = await link.get_attribute("href") or ""
-                parts = [p for p in href.strip("/").split("/") if p]
-                if len(parts) >= 3 and parts[0] == "team":
-                    results_url = "{}/team/{}/{}/results/".format(
-                        BASE_DOMAIN, parts[1], parts[2])
-                    if results_url not in seen_dom:
-                        seen_dom.add(results_url)
-                        found.append((parts[2], results_url))
-                        if DEBUG:
-                            print("[DEBUG] Team URL (DOM): {}".format(results_url))
-                if len(found) >= 2:
-                    break
-
+        team_urls, seen = [], set()
+        for link in await page.query_selector_all("a[href*='/team/']"):
+            href  = await link.get_attribute("href") or ""
+            parts = [p for p in href.strip("/").split("/") if p]
+            if len(parts) >= 3 and parts[0] == "team":
+                results_url = "{}/team/{}/{}/results/".format(
+                    BASE_DOMAIN, parts[1], parts[2])
+                if results_url not in seen:
+                    seen.add(results_url)
+                    team_urls.append((parts[2], results_url))
+                    if DEBUG:
+                        print("[DEBUG] Team URL: {}".format(results_url))
+            if len(team_urls) == 2:
+                break
     except Exception as e:
         if DEBUG:
             print("[DEBUG] fetch_team_urls error: {}".format(e))
+        team_urls = []
     finally:
         await ctx.close()
 
-    return found[:2]
+    return team_urls
 
 
 async def fetch_team_recent_matches(browser: Browser, team_id: str,
@@ -451,12 +394,11 @@ async def fetch_match_stats(browser: Browser, match_id: str) -> list:
         await page.route("**/*", block_resources)
         page.on("response", on_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-        # Try tab click immediately — no fixed wait before first attempt
+        await page.wait_for_timeout(800)
         await dismiss_banners(page)
         clicked = await try_click_stats_tab(page)
 
-        for attempt in range(40):
+        for _ in range(40):
             await page.wait_for_timeout(200)
             if raw_bodies:
                 break
@@ -481,8 +423,7 @@ async def get_full_stats_for_match(browser: Browser, match_id: str,
     """
     1. Get team URLs for selected match
     2. Get last 3 matches for BOTH teams — parallel
-    3. Start fetching stats for each team's matches THE MOMENT their results
-       arrive — don't wait for both teams before starting stats (pipeline).
+    3. Get stats for ALL 6 historical matches — parallel
     """
     # ── 1. Team URLs ─────────────────────────────────────────────────────────
     team_entries = await fetch_team_urls(browser, match_id)
@@ -491,33 +432,31 @@ async def get_full_stats_for_match(browser: Browser, match_id: str,
         return {n: [] for n in team_names}
 
     (home_id, home_url), (away_id, away_url) = team_entries[0], team_entries[1]
-    results = {team_names[0]: [], team_names[1]: []}
 
-    # ── 2+3. Pipeline: start stats fetch as soon as each team's results arrive ─
-    async def process_team(team_id, team_url, label):
-        matches = await fetch_team_recent_matches(browser, team_id, team_url)
-        if not matches:
-            return
-
-        # Start all stats for this team immediately — parallel
-        stat_tasks = [
-            asyncio.ensure_future(fetch_match_stats(browser, m["match_id"]))
-            for m in matches
-        ]
-        stat_results = await asyncio.gather(*stat_tasks, return_exceptions=True)
-
-        for m, stats in zip(matches, stat_results):
-            if isinstance(stats, Exception):
-                if DEBUG:
-                    print("[DEBUG] Stats error {}: {}".format(m["match_id"], stats))
-                stats = []
-            results[label].append({"match": m, "stats": stats})
-
-    # Both teams processed in parallel — each starts its own stats pipeline
-    await asyncio.gather(
-        process_team(home_id, home_url, team_names[0]),
-        process_team(away_id, away_url, team_names[1]),
+    # ── 2. Recent matches — PARALLEL ─────────────────────────────────────────
+    home_matches, away_matches = await asyncio.gather(
+        fetch_team_recent_matches(browser, home_id, home_url),
+        fetch_team_recent_matches(browser, away_id, away_url),
     )
+
+    # ── 3. Stats for all 6 matches — PARALLEL ────────────────────────────────
+    all_labeled = (
+        [(m, team_names[0]) for m in home_matches] +
+        [(m, team_names[1]) for m in away_matches]
+    )
+
+    stat_results = await asyncio.gather(
+        *[fetch_match_stats(browser, m["match_id"]) for m, _ in all_labeled],
+        return_exceptions=True,
+    )
+
+    results = {team_names[0]: [], team_names[1]: []}
+    for (m, label), stats in zip(all_labeled, stat_results):
+        if isinstance(stats, Exception):
+            if DEBUG:
+                print("[DEBUG] Stats error {}: {}".format(m["match_id"], stats))
+            stats = []
+        results[label].append({"match": m, "stats": stats})
 
     return results
 
