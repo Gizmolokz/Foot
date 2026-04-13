@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+XG PREDICTOR v3.1 FULL — ТВОЙ ПАРСЕР + GUI (ИСПРАВЛЕННЫЙ)
+- Правильное определение позиции команды (дома/гости)
+- Добавлены отборы%
+- Корректное заполнение таблицы
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, timedelta
+import asyncio
+import math
+import os
+import time
+import threading
+from typing import List, Dict, Optional, Tuple
+
+try:
+    from playwright.async_api import async_playwright, Browser, BrowserContext
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+import sys
+
+# ==================== КОНСТАНТЫ ====================
+
+COEFFS = {
+    "alpha_box": 0.12,
+    "alpha_out": 0.02,
+    "alpha_touches": 0.015,
+    "pos_baseline": 50.0
+}
+
+DEFAULT_WEIGHTS = [0.5, 0.33, 0.17]
+
+# ==================== ПАРСЕР ====================
+
+BASE_DOMAIN = "https://www.flashscorekz.com"
+
+# ДОБАВЛЕНЫ ОТБОРЫ И ДУЭЛИ
+TARGET_STAT_NAMES = {
+    "Владение мячом", "Всего ударов", "Удары в створ", "Голевые моменты",
+    "Угловые", "Удары из пределов штрафной", "Удары   з-за штрафной",
+    "Касания мяча в штрафной соперника", "Выносы",
+    "Отборы", "Выиграно дуэлей",
+    "Ball Possession", "Total Shots", "Shots on Goal", "Big Chances",
+    "Corner Kicks", "Shots Inside Box", "Shots Outside Box",
+    "Touches in Opposition Box", "Clearances",
+    "Tackles", "Duels Won",
+}
+
+BLOCK_URL_PATTERNS = [
+    "google", "gstatic", "analytics", "gtm", "doubleclick",
+    "syndication", "pagead", "facebook", "twitter", "cdn.cookielaw",
+]
+
+BLOCK_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".mp4", ".webm", ".mp3", ".ico",
+)
+
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+]
+
+CONTEXT_OPTS = dict(
+    user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+    ),
+    locale="ru-RU",
+    viewport={"width": 1280, "height": 800},
+)
+
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver',          { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins',            { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages',          { get: () => ['ru-RU','ru','en-US','en'] });
+    Object.defineProperty(navigator, 'platform',           { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'hardwareConcurrency',{ get: () => 8 });
+    window.chrome = { runtime: {} };
+"""
+
+BANNER_SELECTORS = [
+    "text=IK BEN 24 EN OUDER", "text=24 EN OUDER",
+    "text=I'M 18 OR OLDER", "text=I AM 18 OR OLDER",
+    "text=ACCEPT & CLOSE", "text=Accept", "text=Принять",
+    "[id*='onetrust-accept']",
+]
+
+STATS_TAB_SELECTORS = [
+    "a[href*='match-statistics']", "[class*='statistics']",
+    "text=Статистика матча", "text=Match Statistics",
+    "text=Статистика", "text=Statistics",
+]
+
+MATCH_SECTION_NAMES = {"Матч", "Match"}
+
+
+# ==================== ФУНКЦИИ ПАРСЕРА ====================
+
+async def block_resources(route, request):
+    url = request.url
+    if any(p in url for p in BLOCK_URL_PATTERNS):
+        await route.abort()
+        return
+    if any(url.split("?")[0].endswith(ext) for ext in BLOCK_EXTENSIONS):
+        await route.abort()
+        return
+    await route.continue_()
+
+
+async def new_ctx(browser: Browser):
+    ctx = await browser.new_context(**CONTEXT_OPTS)
+    await ctx.add_init_script(STEALTH_SCRIPT)
+    page = await ctx.new_page()
+    return ctx, page
+
+
+def parse_feed(raw: str):
+    records = []
+    for block in raw.split("~"):
+        block = block.strip()
+        if not block:
+            continue
+        record = {}
+        for pair in block.split("¬"):
+            if "÷" in pair:
+                k, _, v = pair.partition("÷")
+                record[k.strip()] = v.strip()
+        if record:
+            records.append(record)
+    return records
+
+
+def parse_matches_from_feed(raw: str):
+    records = parse_feed(raw)
+    matches, seen_ids = [], set()
+    for r in records:
+        match_id = r.get("AA", "")
+        timestamp = r.get("AD", "")
+        if not match_id or not timestamp:
+            continue
+        if len(match_id) < 5 or not timestamp.isdigit():
+            continue
+        if match_id in seen_ids:
+            continue
+        seen_ids.add(match_id)
+        try:
+            dt = datetime.fromtimestamp(int(timestamp)).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            dt = timestamp
+        home_score = r.get("AG", r.get("WM", ""))
+        away_score = r.get("AH", r.get("WN", ""))
+        matches.append({
+            "match_id": match_id,
+            "date": dt,
+            "home_team": r.get("CX", r.get("WU", r.get("EW", ""))),
+            "away_team": r.get("AF", r.get("WV", r.get("EX", ""))),
+            "home_score": home_score or "-",
+            "away_score": away_score or "-",
+            "league": r.get("CL", r.get("AL", "")),
+        })
+    return matches
+
+
+def parse_stats_from_feed(raw: str):
+    records = parse_feed(raw)
+    stats, seen_names, in_match = [], set(), False
+    for r in records:
+        if "SE" in r:
+            in_match = r.get("SE", "").strip() in MATCH_SECTION_NAMES
+            continue
+        if not in_match:
+            continue
+        if "SF" in r and not r.get("SG"):
+            continue
+        name = r.get("SG", "")
+        home = r.get("SH", "")
+        away = r.get("SI", "")
+        if name and home and away and name not in seen_names:
+            seen_names.add(name)
+            stats.append({
+                "name": name,
+                "home": home,
+                "away": away,
+                "is_target": name in TARGET_STAT_NAMES,
+            })
+    return stats
+
+
+def merge_stats(stats_list):
+    merged, seen = [], set()
+    for stats in stats_list:
+        for s in stats:
+            if s["name"] not in seen:
+                seen.add(s["name"])
+                merged.append(s)
+    return merged
+
+
+async def dismiss_banners(page):
+    for sel in BANNER_SELECTORS:
+        try:
+            await page.click(sel, timeout=400)
+            await page.wait_for_timeout(200)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def try_click_stats_tab(page):
+    for sel in STATS_TAB_SELECTORS:
+        try:
+            await page.click(sel, timeout=1500)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def fetch_day_matches(browser: Browser, date_str: str = "") -> list:
+    raw_bodies, seen_keys = [], set()
+
+    def on_response(response):
+        async def _read():
+            try:
+                body = await response.body()
+                text = body.decode("utf-8", errors="replace")
+                key = text[:80]
+                if key in seen_keys or len(text) < 100:
+                    return
+                seen_keys.add(key)
+                if "AA÷" in text:
+                    raw_bodies.append(text)
+            except Exception:
+                pass
+
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto("{}/football/".format(BASE_DOMAIN),
+                        wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+        if date_str:
+            await page.evaluate("window.location.hash = '/{}'".format(date_str))
+            await page.wait_for_timeout(1500)
+
+        for _ in range(60):
+            await page.wait_for_timeout(250)
+            if raw_bodies:
+                await page.wait_for_timeout(800)
+                break
+    finally:
+        await ctx.close()
+
+    all_matches, seen_ids = [], set()
+    for body in raw_bodies:
+        for m in parse_matches_from_feed(body):
+            if m["match_id"] not in seen_ids:
+                seen_ids.add(m["match_id"])
+                all_matches.append(m)
+    all_matches.sort(key=lambda m: m["date"])
+    return all_matches
+
+
+async def fetch_team_urls(browser: Browser, match_id: str) -> list:
+    url = "{}/match/{}/".format(BASE_DOMAIN, match_id)
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+        await page.wait_for_timeout(1000)
+
+        team_urls, seen = [], set()
+        for link in await page.query_selector_all("a[href*='/team/']"):
+            href = await link.get_attribute("href") or ""
+            parts = [p for p in href.strip("/").split("/") if p]
+            if len(parts) >= 3 and parts[0] == "team":
+                results_url = "{}/team/{}/{}/results/".format(
+                    BASE_DOMAIN, parts[1], parts[2])
+                if results_url not in seen:
+                    seen.add(results_url)
+                    team_urls.append((parts[2], results_url))
+            if len(team_urls) == 2:
+                break
+    except Exception:
+        team_urls = []
+    finally:
+        await ctx.close()
+
+    return team_urls
+
+
+async def fetch_team_recent_matches(browser: Browser, team_id: str,
+                                    results_url: str, count: int = 3) -> list:
+    patterns = [
+        "tr_1_{}".format(team_id), "tr_4_{}".format(team_id),
+        "tr_2_{}".format(team_id), team_id,
+    ]
+    captured = {}
+
+    def on_response(response):
+        async def _read():
+            for pat in patterns:
+                if pat in response.url:
+                    try:
+                        body = await response.body()
+                        text = body.decode("utf-8", errors="replace")
+                        if text and text.strip() not in ("0", ""):
+                            captured[pat] = text
+                    except Exception:
+                        pass
+
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto(results_url, wait_until="domcontentloaded", timeout=60000)
+        await dismiss_banners(page)
+        for _ in range(40):
+            await page.wait_for_timeout(250)
+            if any(captured.values()):
+                break
+    finally:
+        await ctx.close()
+
+    for body in captured.values():
+        matches = parse_matches_from_feed(body)
+        if matches:
+            return matches[:count]
+    return []
+
+
+async def fetch_match_stats(browser: Browser, match_id: str) -> list:
+    url = "{}/match/{}/".format(BASE_DOMAIN, match_id)
+    raw_bodies = []
+
+    def on_response(response):
+        async def _read():
+            resp_url = response.url
+            if match_id in resp_url or "dc_1_" in resp_url:
+                try:
+                    body = await response.body()
+                    text = body.decode("utf-8", errors="replace")
+                    if text and text.strip() not in ("0", "") and "SG÷" in text:
+                        raw_bodies.append(text)
+                except Exception:
+                    pass
+
+        asyncio.ensure_future(_read())
+
+    ctx, page = await new_ctx(browser)
+    try:
+        await page.route("**/*", block_resources)
+        page.on("response", on_response)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(800)
+        await dismiss_banners(page)
+        clicked = await try_click_stats_tab(page)
+
+        for _ in range(40):
+            await page.wait_for_timeout(200)
+            if raw_bodies:
+                break
+            if not clicked:
+                await dismiss_banners(page)
+                clicked = await try_click_stats_tab(page)
+    finally:
+        await ctx.close()
+
+    return merge_stats([parse_stats_from_feed(b) for b in raw_bodies]) if raw_bodies else []
+
+
+async def get_full_stats_for_match(browser: Browser, match_id: str,
+                                   team_names: list, status_callback=None) -> dict:
+    """Получение статистики для матча"""
+
+    if status_callback:
+        status_callback("🔗 Получаю URL команд...")
+
+    team_entries = await fetch_team_urls(browser, match_id)
+
+    if len(team_entries) < 2:
+        return {n: [] for n in team_names}
+
+    (home_id, home_url), (away_id, away_url) = team_entries[0], team_entries[1]
+
+    if status_callback:
+        status_callback("📊 Загружаю последние матчи...")
+
+    home_matches, away_matches = await asyncio.gather(
+        fetch_team_recent_matches(browser, home_id, home_url),
+        fetch_team_recent_matches(browser, away_id, away_url),
+    )
+
+    if status_callback:
+        status_callback("📈 Получаю статистику матчей...")
+
+    all_labeled = (
+            [(m, team_names[0]) for m in home_matches] +
+            [(m, team_names[1]) for m in away_matches]
+    )
+
+    stat_results = await asyncio.gather(
+        *[fetch_match_stats(browser, m["match_id"]) for m, _ in all_labeled],
+        return_exceptions=True,
+    )
+
+    results = {team_names[0]: [], team_names[1]: []}
+    for (m, label), stats in zip(all_labeled, stat_results):
+        if isinstance(stats, Exception):
+            stats = []
+        results[label].append({"match": m, "stats": stats})
+
+    return results
+
+
+# ==================== HELPERS ====================
+
+def safe_float(s):
+    try:
+        if s is None:
+            return None
+        st = str(s).strip().replace(',', '.')
+        if st == '':
+            return None
+        return float(st)
+    except:
+        return None
+
+
+def poisson_pmf(k: int, mu: float) -> float:
+    if mu <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-mu) * (mu ** k) / math.factorial(k)
+
+
+def poisson_cdf(k: int, mu: float) -> float:
+    return sum(poisson_pmf(i, mu) for i in range(0, k + 1))
+
+
+def prob_ge(k: int, mu: float) -> float:
+    if k <= 0:
+        return 1.0
+    return 1.0 - poisson_cdf(k - 1, mu)
+
+
+def weighted_avg(values: List[float], weights: Optional[List[float]] = None) -> float:
+    if not values:
+        return 0.0
+    if weights is None or len(weights) != len(values):
+        weights = [1.0 / len(values)] * len(values)
+    total = sum(weights)
+    if total == 0:
+        return 0.0
+    return sum(v * w for v, w in zip(values, weights)) / total
+
+
+def calculate_xg(team_data, opp_data):
+    def wavg(list_of_dicts, field):
+        vals = [float(d.get(field, 0) or 0.0) for d in list_of_dicts]
+        return weighted_avg(vals, DEFAULT_WEIGHTS)
+
+    avg_pos = wavg(team_data, 'pos')
+    avg_sh_in = wavg(team_data, 'shots_in_box')
+    avg_sh_out = wavg(team_data, 'shots_out_box')
+    avg_touches = wavg(team_data, 'touches_in_box')
+    opp_avg_sh_in = wavg(opp_data, 'shots_in_box')
+
+    xg_attack = (COEFFS['alpha_box'] * avg_sh_in + COEFFS['alpha_out'] * avg_sh_out +
+                 COEFFS['alpha_touches'] * avg_touches)
+    pos_factor = (avg_pos / COEFFS['pos_baseline']) if COEFFS['pos_baseline'] else 1.0
+    xg_attack *= pos_factor
+
+    opp_def_proxy = COEFFS['alpha_box'] * opp_avg_sh_in
+    xg = max(0.0, 0.5 * (xg_attack + opp_def_proxy))
+
+    return max(0.1, min(xg, 4.0))
+
+
+def compute_probs(xg1, xg2):
+    p1 = pd = p2 = 0.0
+
+    for i in range(8):
+        for j in range(8):
+            p = poisson_pmf(i, xg1) * poisson_pmf(j, xg2)
+            if i > j:
+                p1 += p
+            elif i == j:
+                pd += p
+            else:
+                p2 += p
+
+    s = p1 + pd + p2
+    if s > 0:
+        p1, pd, p2 = p1 / s, pd / s, p2 / s
+
+    return p1, pd, p2
+
+
+# ==================== DATE PICKER ====================
+
+class DatePickerDialog(tk.Toplevel):
+    def __init__(self, parent, initial_date=None):
+        super().__init__(parent)
+        self.title("📅 Выбор даты")
+        self.geometry("380x320")
+        self.resizable(False, False)
+        self.configure(bg="#0a0e27")
+
+        self.selected_date = None
+
+        if initial_date is None:
+            initial_date = datetime.now()
+        elif isinstance(initial_date, str):
+            try:
+                initial_date = datetime.strptime(initial_date, "%Y-%m-%d")
+            except:
+                initial_date = datetime.now()
+
+        self.current_date = initial_date
+        self.transient(parent)
+        self.grab_set()
+
+        self._create_widgets()
+        self._update_calendar()
+        parent.wait_window(self)
+
+    def _create_widgets(self):
+        header = tk.Frame(self, bg="#1a1f3a")
+        header.pack(fill="x", padx=10, pady=10)
+
+        tk.Button(header, text="◀", font=("Arial", 12), bg="#FF33FF",
+                  command=self._prev_month, width=2).pack(side="left")
+
+        self.month_label = tk.Label(header, text="", font=("Arial", 12, "bold"),
+                                    bg="#1a1f3a", fg="#00AAFF")
+        self.month_label.pack(side="left", expand=True)
+
+        tk.Button(header, text="▶", font=("Arial", 12), bg="#FF33FF",
+                  command=self._next_month, width=2).pack(side="right")
+
+        self.calendar_frame = tk.Frame(self, bg="#0a0e27")
+        self.calendar_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        bottom = tk.Frame(self, bg="#0a0e27")
+        bottom.pack(fill="x", padx=10, pady=10)
+
+        tk.Button(bottom, text="✅ OK", bg="#00FF33", fg="black",
+                  command=self._ok, width=12).pack(side="left", padx=5)
+        tk.Button(bottom, text="❌ Отмена", bg="#FF3333", fg="white",
+                  command=self._cancel, width=12).pack(side="right", padx=5)
+
+    def _update_calendar(self):
+        months = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн",
+                  "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+        self.month_label.config(
+            text=f"{months[self.current_date.month - 1]} {self.current_date.year}"
+        )
+
+        for w in self.calendar_frame.winfo_children():
+            w.destroy()
+
+        first_day = self.current_date.replace(day=1)
+        first_wd = first_day.weekday()
+
+        if self.current_date.month == 12:
+            last_day = 31
+        else:
+            last_day = (self.current_date.replace(month=self.current_date.month + 1, day=1) - timedelta(days=1)).day
+
+        col, row = first_wd, 0
+
+        for day in range(1, last_day + 1):
+            is_today = (self.current_date.replace(day=day) == datetime.now().date())
+
+            btn = tk.Button(
+                self.calendar_frame, text=str(day),
+                font=("Arial", 9, "bold"),
+                bg="#00CCFF" if is_today else "#1a1f3a",
+                fg="black" if is_today else "#00AAFF",
+                width=4, height=2,
+                command=lambda d=day: self._select_day(d)
+            )
+            btn.grid(row=row, column=col, padx=1, pady=1)
+
+            col += 1
+            if col > 6:
+                col = 0
+                row += 1
+
+    def _select_day(self, day):
+        self.current_date = self.current_date.replace(day=day)
+        self._update_calendar()
+
+    def _prev_month(self):
+        if self.current_date.month == 1:
+            self.current_date = self.current_date.replace(year=self.current_date.year - 1, month=12)
+        else:
+            self.current_date = self.current_date.replace(month=self.current_date.month - 1)
+        self._update_calendar()
+
+    def _next_month(self):
+        if self.current_date.month == 12:
+            self.current_date = self.current_date.replace(year=self.current_date.year + 1, month=1)
+        else:
+            self.current_date = self.current_date.replace(month=self.current_date.month + 1)
+        self._update_calendar()
+
+    def _ok(self):
+        self.selected_date = self.current_date.strftime("%Y-%m-%d")
+        self.destroy()
+
+    def _cancel(self):
+        self.destroy()
+
+
+# ==================== ГЛАВНОЕ GUI ====================
+
+class XGPredictorFinal(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("⚽ XG PREDICTOR v3.1 — Твой парсер + прогноз")
+        self.geometry("1500x950")
+        self.minsize(1300, 850)
+        self.configure(bg="#0a0e27")
+
+        self.header_font = ("Segoe UI", 11, "bold")
+        self.input_font = ("Segoe UI", 10, "bold")
+        self.output_font = ("Consolas", 9, "bold")
+        self.small_font = ("Segoe UI", 8, "bold")
+        self.label_font = ("Segoe UI", 7, "bold")
+
+        self.matches = []
+        self.selected_match = None
+
+        main_frame = tk.Frame(self, bg="#0a0e27")
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        main_frame.columnconfigure(0, weight=1, minsize=300)
+        main_frame.columnconfigure(1, weight=1, minsize=300)
+        main_frame.columnconfigure(2, weight=2, minsize=700)
+        main_frame.rowconfigure(0, weight=1)
+
+        self._create_left_panel(main_frame)
+        self._create_middle_panel(main_frame)
+        self._create_right_panel(main_frame)
+
+        self.status_bar = tk.Label(self, text="🟢 Готов к работе...",
+                                   font=("Segoe UI", 8, "bold"), bg="#1a1f3a", fg="#00FF66",
+                                   anchor="w", relief="sunken", bd=1)
+        self.status_bar.pack(fill="x", side="bottom")
+
+    def _update_status(self, message: str, color: str = "#00FF66"):
+        self.status_bar.config(text=message, fg=color)
+        self.update_idletasks()
+
+    def _create_left_panel(self, parent):
+        left_frame = tk.Frame(parent, bg="#0a0e27")
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        tk.Label(left_frame, text="📅 ДАТА И ПОИСК",
+                 font=self.header_font, bg="#0a0e27", fg="#00AAFF").pack(pady=5)
+
+        date_frame = tk.Frame(left_frame, bg="#1a1f3a")
+        date_frame.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(date_frame, text="Дата (YYYY-MM-DD):",
+                 font=self.small_font, bg="#1a1f3a", fg="white").pack(anchor="w", pady=3)
+
+        self.date_entry = tk.Entry(date_frame, font=self.input_font,
+                                   bg="#111111", fg="#00FF66",
+                                   insertbackground="#00FF66",
+                                   relief="solid", bd=1)
+        self.date_entry.pack(fill="x", pady=3)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+        btn_frame = tk.Frame(left_frame, bg="#0a0e27")
+        btn_frame.pack(fill="x", padx=5, pady=5)
+
+        self.btn_load = tk.Button(btn_frame, text="🔄 ЗАГРУЗИТЬ МАТЧИ",
+                                  font=self.input_font,
+                                  bg="#00FF33", fg="black",
+                                  activebackground="#66FF66",
+                                  command=self._load_matches,
+                                  relief="raised", bd=2)
+        self.btn_load.pack(fill="x", pady=3)
+
+        tk.Button(btn_frame, text="📍 Сегодня",
+                  font=self.small_font,
+                  bg="#FF33FF", activebackground="#FF66FF",
+                  command=self._select_today,
+                  relief="raised", bd=1).pack(fill="x", pady=2)
+
+        tk.Button(btn_frame, text="➡️ Завтра",
+                  font=self.small_font,
+                  bg="#FF9900", activebackground="#FFAA33",
+                  command=self._select_tomorrow,
+                  relief="raised", bd=1).pack(fill="x", pady=2)
+
+        tk.Button(btn_frame, text="📅 ВЫБРАТЬ ДАТУ",
+                  font=self.input_font,
+                  bg="#00AAFF", fg="black",
+                  activebackground="#00CCFF",
+                  command=self._open_date_picker,
+                  relief="raised", bd=2).pack(fill="x", pady=3)
+
+        search_frame = tk.Frame(left_frame, bg="#0a0e27")
+        search_frame.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(search_frame, text="🔍 Поиск матча:",
+                 font=self.small_font, bg="#0a0e27", fg="white").pack(anchor="w")
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace("w", lambda *args: self._refresh_matches_list())
+
+        search_entry = tk.Entry(search_frame, textvariable=self.search_var,
+                                font=self.input_font,
+                                bg="#1a1f3a", fg="#00FF66",
+                                insertbackground="#00FF66",
+                                relief="solid", bd=1)
+        search_entry.pack(fill="x", pady=3)
+
+    def _create_middle_panel(self, parent):
+        middle_frame = tk.Frame(parent, bg="#0a0e27")
+        middle_frame.grid(row=0, column=1, sticky="nsew", padx=5)
+
+        tk.Label(middle_frame, text="⚽ МАТЧИ",
+                 font=self.header_font, bg="#0a0e27", fg="#00FF66").pack(pady=5)
+
+        list_frame = tk.Frame(middle_frame, bg="#0a0e27")
+        list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.matches_listbox = tk.Listbox(list_frame,
+                                          font=self.small_font,
+                                          bg="#1a1f3a", fg="#00FF66",
+                                          selectmode="single",
+                                          yscrollcommand=scrollbar.set,
+                                          relief="solid", bd=1)
+        self.matches_listbox.pack(side="left", fill="both", expand=True)
+        self.matches_listbox.bind("<<ListboxSelect>>", self._on_match_select)
+        scrollbar.config(command=self.matches_listbox.yview)
+
+        info_frame = tk.Frame(middle_frame, bg="#1a1f3a")
+        info_frame.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(info_frame, text="ℹ️ ИНФОРМАЦИЯ:",
+                 font=self.small_font, bg="#1a1f3a", fg="#FFAA00").pack(anchor="w")
+
+        self.info_text = tk.Text(info_frame, height=8, width=40,
+                                 font=("Consolas", 7),
+                                 bg="#0a0e27", fg="#00AAFF",
+                                 relief="solid", bd=1)
+        self.info_text.pack(fill="both", expand=True, pady=3)
+        self.info_text.configure(state="disabled")
+
+    def _create_right_panel(self, parent):
+        right_frame = tk.Frame(parent, bg="#0a0e27")
+        right_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+
+        right_frame.rowconfigure(0, weight=0)
+        right_frame.rowconfigure(1, weight=1)
+        right_frame.rowconfigure(2, weight=1)
+
+        buttons_frame = tk.Frame(right_frame, bg="#0a0e27")
+        buttons_frame.grid(row=0, column=0, sticky="ew", pady=5)
+
+        self.btn_parse = tk.Button(buttons_frame, text="🔍 ПАРСИТЬ СТАТИСТИКУ",
+                                   font=self.input_font,
+                                   bg="#00CCFF", fg="black",
+                                   activebackground="#00EEFF",
+                                   command=self._parse_match_stats,
+                                   relief="raised", bd=2)
+        self.btn_parse.pack(side="left", fill="x", expand=True, padx=(0, 3))
+
+        self.btn_predict = tk.Button(buttons_frame, text="🎯 ПРОГНОЗ",
+                                     font=self.input_font,
+                                     bg="#00FF33", fg="black",
+                                     activebackground="#66FF66",
+                                     command=self._calculate_prediction,
+                                     relief="raised", bd=2)
+        self.btn_predict.pack(side="left", fill="x", expand=True, padx=3)
+
+        self.btn_save = tk.Button(buttons_frame, text="💾 СОХРАНИТЬ",
+                                  font=self.input_font,
+                                  bg="#FF33FF", fg="white",
+                                  activebackground="#FF66FF",
+                                  command=self._save_report,
+                                  relief="raised", bd=2)
+        self.btn_save.pack(side="left", fill="x", expand=True, padx=(3, 0))
+
+        data_frame = tk.LabelFrame(right_frame, text="📊 СТАТИСТИКА",
+                                   font=self.header_font, bg="#0a0e27", fg="#00AAFF",
+                                   relief="solid", bd=1)
+        data_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+
+        self._create_stats_table(data_frame)
+
+        forecast_frame = tk.LabelFrame(right_frame, text="🏆 ПРОГНОЗ",
+                                       font=self.header_font, bg="#0a0e27", fg="#FF33FF",
+                                       relief="solid", bd=1)
+        forecast_frame.grid(row=2, column=0, sticky="nsew", pady=5)
+
+        forecast_scroll = tk.Frame(forecast_frame, bg="#0a0e27")
+        forecast_scroll.pack(fill="both", expand=True, padx=3, pady=3)
+
+        scrollbar_forecast = tk.Scrollbar(forecast_scroll)
+        scrollbar_forecast.pack(side="right", fill="y")
+
+        self.forecast_text = tk.Text(forecast_scroll, height=15,
+                                     font=self.output_font,
+                                     bg="#000000", fg="#00FF66",
+                                     yscrollcommand=scrollbar_forecast.set,
+                                     relief="solid", bd=1)
+        self.forecast_text.pack(side="left", fill="both", expand=True)
+        scrollbar_forecast.config(command=self.forecast_text.yview)
+        self.forecast_text.configure(state="disabled")
+
+    def _create_stats_table(self, parent):
+        headers = ["", "Влад", "Уд", "В тв", "Мом", "Угл", "В ш", "Из ш", "Каст", "Отб%", "Дуэли", "Вын"]
+
+        table_frame = tk.Frame(parent, bg="#0a0e27")
+        table_frame.pack(fill="both", expand=True, padx=3, pady=3)
+
+        for col in range(len(headers)):
+            table_frame.grid_columnconfigure(col, weight=1, minsize=38)
+
+        for col, header in enumerate(headers):
+            lbl = tk.Label(table_frame, text=header,
+                           font=self.label_font, bg="#1a1f3a", fg="white",
+                           relief="solid", bd=1)
+            lbl.grid(row=0, column=col, sticky="nsew", padx=1, pady=1)
+
+        self.team1_entries = []
+        self.team2_entries = []
+
+        entry_style = {
+            'font': ("Segoe UI", 7),
+            'justify': "center",
+            'relief': "solid",
+            'bd': 1,
+            'width': 3
+        }
+
+        field_names = ["pos", "total_shots", "shots_on_target", "goal_scoring_chances",
+                       "corners", "shots_in_box", "shots_out_box", "touches_in_box",
+                       "tackle_success", "duels_won", "clearances"]
+
+        for m_idx in range(3):
+            lbl = tk.Label(table_frame, text=f"К1М{m_idx + 1}",
+                           font=self.label_font, bg="#0a0e27", fg="#00FF66",
+                           relief="solid", bd=1)
+            lbl.grid(row=m_idx + 1, column=0, sticky="nsew", padx=1, pady=1)
+
+            row_entries = {}
+            for col in range(1, 12):
+                entry = tk.Entry(table_frame, **entry_style,
+                                 bg="#111111", fg="#00FF66",
+                                 insertbackground="#00FF66")
+                entry.grid(row=m_idx + 1, column=col, sticky="nsew", padx=1, pady=1)
+                row_entries[field_names[col - 1]] = entry
+
+            self.team1_entries.append(row_entries)
+
+        sep = tk.Frame(table_frame, height=2, bg="#444444")
+        sep.grid(row=4, column=0, columnspan=12, sticky="ew", pady=2)
+
+        for m_idx in range(3):
+            lbl = tk.Label(table_frame, text=f"К2М{m_idx + 1}",
+                           font=self.label_font, bg="#0a0e27", fg="#FF6600",
+                           relief="solid", bd=1)
+            lbl.grid(row=5 + m_idx, column=0, sticky="nsew", padx=1, pady=1)
+
+            row_entries = {}
+            for col in range(1, 12):
+                entry = tk.Entry(table_frame, **entry_style,
+                                 bg="#111111", fg="#FF6600",
+                                 insertbackground="#FF6600")
+                entry.grid(row=5 + m_idx, column=col, sticky="nsew", padx=1, pady=1)
+                row_entries[field_names[col - 1]] = entry
+
+            self.team2_entries.append(row_entries)
+
+    def _open_date_picker(self):
+        current_date = self.date_entry.get()
+        dialog = DatePickerDialog(self, current_date)
+        if dialog.selected_date:
+            self.date_entry.delete(0, tk.END)
+            self.date_entry.insert(0, dialog.selected_date)
+
+    def _select_today(self):
+        self.date_entry.delete(0, tk.END)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+    def _select_tomorrow(self):
+        self.date_entry.delete(0, tk.END)
+        tomorrow = datetime.now() + timedelta(days=1)
+        self.date_entry.insert(0, tomorrow.strftime("%Y-%m-%d"))
+
+    def _load_matches(self):
+        if not PLAYWRIGHT_AVAILABLE:
+            messagebox.showerror("Ошибка", "Playwright не установлен!")
+            return
+
+        date_str = self.date_entry.get().strip()
+
+        def run_parser():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                async def fetch():
+                    async with async_playwright() as pw:
+                        browser = await pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+                        try:
+                            matches = await fetch_day_matches(browser, date_str)
+                            return matches
+                        finally:
+                            await browser.close()
+
+                start_time = time.time()
+                matches = loop.run_until_complete(fetch())
+                elapsed = time.time() - start_time
+
+                self.matches = matches if matches else []
+                self.after(0, self._refresh_matches_list)
+                self.after(0, lambda: self._update_status(
+                    f"✅ Загружено {len(self.matches)} матчей за {elapsed:.1f} сек",
+                    "#00FF66" if self.matches else "#FF9900"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Ошибка", f"{str(e)[:200]}"))
+                self.after(0, lambda: self._update_status(f"❌ Ошибка", "#FF3333"))
+            finally:
+                self.after(0, lambda: self.btn_load.config(state="normal", text="🔄 ЗАГРУЗИТЬ МАТЧИ"))
+
+        self.btn_load.config(state="disabled", text="⏳ ЗАГРУЗКА...")
+        thread = threading.Thread(target=run_parser, daemon=True)
+        thread.start()
+
+    def _refresh_matches_list(self):
+        self.matches_listbox.delete(0, tk.END)
+        search_query = self.search_var.get().lower()
+
+        for match in self.matches:
+            match_text = f"{match.get('date', '')} | {match.get('home_team', '?')} - {match.get('away_team', '?')}"
+            if search_query in match_text.lower() or not search_query:
+                self.matches_listbox.insert(tk.END, match_text)
+
+    def _on_match_select(self, event):
+        selection = self.matches_listbox.curselection()
+        if not selection:
+            return
+
+        search_query = self.search_var.get().lower()
+        filtered = [m for m in self.matches
+                    if
+                    search_query in f"{m.get('date', '')} | {m.get('home_team', '?')} - {m.get('away_team', '?')}".lower() or not search_query]
+
+        if selection[0] < len(filtered):
+            self.selected_match = filtered[selection[0]]
+            self._update_match_info()
+
+    def _update_match_info(self):
+        if not self.selected_match:
+            return
+
+        info = f"""ID: {self.selected_match.get('match_id', '?')}
+Дата: {self.selected_match.get('date', '?')}
+Хозяева: {self.selected_match.get('home_team', '?')}
+Гости: {self.selected_match.get('away_team', '?')}
+Лига: {self.selected_match.get('league', '?')}
+Счет: {self.selected_match.get('home_score', '-')}:{self.selected_match.get('away_score', '-')}
+
+➡️ Нажмите ПАРСИТЬ"""
+
+        self.info_text.configure(state="normal")
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert("1.0", info)
+        self.info_text.configure(state="disabled")
+
+    def _parse_match_stats(self):
+        if not self.selected_match:
+            messagebox.showwarning("Предупреждение", "Выберите матч")
+            return
+
+        if not PLAYWRIGHT_AVAILABLE:
+            messagebox.showerror("Ошибка", "Playwright не установлен")
+            return
+
+        team_names = [self.selected_match.get('home_team', 'Team1'),
+                      self.selected_match.get('away_team', 'Team2')]
+        match_id = self.selected_match.get('match_id', '')
+
+        def parse_thread():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                async def fetch():
+                    async with async_playwright() as pw:
+                        browser = await pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+                        try:
+                            result = await get_full_stats_for_match(browser, match_id, team_names, self._update_status)
+                            return result
+                        finally:
+                            await browser.close()
+
+                start_time = time.time()
+                result = loop.run_until_complete(fetch())
+                elapsed = time.time() - start_time
+
+                if result:
+                    self.after(0, lambda: self._fill_stats_table_corrected(result, team_names))
+                    self.after(0, lambda: self._update_status(f"✅ Парсинг завершен за {elapsed:.1f} сек", "#00FF66"))
+
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Ошибка", f"{str(e)[:200]}"))
+            finally:
+                self.after(0, lambda: self.btn_parse.config(state="normal", text="🔍 ПАРСИТЬ СТАТИСТИКУ"))
+
+        self.btn_parse.config(state="disabled", text="⏳ ПАРСИНГ...")
+        thread = threading.Thread(target=parse_thread, daemon=True)
+        thread.start()
+
+    def _fill_stats_table_corrected(self, data, team_names):
+        """Заполнение таблицы - правильно определяет позицию команды"""
+        try:
+            # МАППИНГ - расширен для поиска по разным названиям
+            stat_mapping = {
+                'pos': ['владение', 'possession'],
+                'total_shots': ['всего ударов', 'total shots'],
+                'shots_on_target': ['удары в створ', 'shots on goal'],
+                'goal_scoring_chances': ['голевые моменты', 'big chances'],
+                'corners': ['угловые', 'corner'],
+                'shots_in_box': ['пределов штрафной', 'shots inside'],
+                'shots_out_box': ['из-за штрафной', 'shots outside'],
+                'touches_in_box': ['касания', 'touches'],
+                'tackle_success': ['отборы', 'tackles'],  # ← ДОБАВЛЕНЫ ОТБОРЫ
+                'duels_won': ['выиграно дуэлей', 'duels won'],
+                'clearances': ['выносы', 'clearances'],
+            }
+
+            home_team = team_names[0]  # К1 - ДОМАШНЯЯ КОМАНДА В ПРОГРАММЕ
+            away_team = team_names[1]  # К2 - ГОСТЕВАЯ КОМАНДА В ПРОГРАММЕ
+
+            home_matches = data.get(home_team, [])
+            away_matches = data.get(away_team, [])
+
+            print(f"\n{'=' * 70}")
+            print(f"ЗАПОЛНЕНИЕ ТАБЛИЦЫ")
+            print(f"{'=' * 70}")
+            print(f"К1 (ДОМАШНЯЯ): {home_team} - {len(home_matches)} матчей")
+            print(f"К2 (ГОСТЕВАЯ): {away_team} - {len(away_matches)} матчей")
+            print(f"{'=' * 70}\n")
+
+            # ===== ЗАПОЛНЯЕ   К1 =====
+            for m_idx, match_data in enumerate(home_matches[:3]):
+                stats_list = match_data.get('stats', [])
+                match_info = match_data.get('match', {})
+
+                match_home = match_info.get('home_team', '').strip()
+                match_away = match_info.get('away_team', '').strip()
+
+                # КЛЮЧЕВОЕ: определяем, дома ли играла К1 в этом матче
+                was_home_k1 = (match_home.lower() == home_team.lower())
+
+                print(f"\nК1 М{m_idx + 1}: {match_home} vs {match_away}")
+                print(f"  К1 была: {'ДОМА' if was_home_k1 else 'В ГОСТЯХ'}")
+                print(f"  Статистика: {len(stats_list)} показателей")
+
+                for field_name, entry_widget in self.team1_entries[m_idx].items():
+                    value = 0.0
+                    found = False
+
+                    for stat in stats_list:
+                        stat_name_lower = stat['name'].lower().strip()
+
+                        for alias in stat_mapping.get(field_name, []):
+                            if alias.lower() in stat_name_lower:
+                                # ГЛАВНОЕ: правильно берём значение!
+                                if was_home_k1:
+                                    # К1 была ДОМА → берём 'home'
+                                    try:
+                                        value = float(str(stat['home']).rstrip('%'))
+                                        found = True
+                                    except:
+                                        pass
+                                else:
+                                    # К1 была В ГОСТЯХ → берём 'away'
+                                    try:
+                                        value = float(str(stat['away']).rstrip('%'))
+                                        found = True
+                                    except:
+                                        pass
+                                break
+
+                        if found:
+                            break
+
+                    entry_widget.delete(0, tk.END)
+                    entry_widget.insert(0, f"{value:.1f}")
+                    print(f"    {field_name}: {value}")
+
+            # ===== ЗАПОЛНЯЕМ К2 =====
+            for m_idx, match_data in enumerate(away_matches[:3]):
+                stats_list = match_data.get('stats', [])
+                match_info = match_data.get('match', {})
+
+                match_home = match_info.get('home_team', '').strip()
+                match_away = match_info.get('away_team', '').strip()
+
+                # КЛЮЧЕВОЕ: определяем, дома ли играла К2 в этом матче
+                was_home_k2 = (match_home.lower() == away_team.lower())
+
+                print(f"\nК2 М{m_idx + 1}: {match_home} vs {match_away}")
+                print(f"  К2 была: {'ДОМА' if was_home_k2 else 'В ГОСТЯХ'}")
+                print(f"  Статистика: {len(stats_list)} показателей")
+
+                for field_name, entry_widget in self.team2_entries[m_idx].items():
+                    value = 0.0
+                    found = False
+
+                    for stat in stats_list:
+                        stat_name_lower = stat['name'].lower().strip()
+
+                        for alias in stat_mapping.get(field_name, []):
+                            if alias.lower() in stat_name_lower:
+                                # ГЛАВНОЕ: правильно берём значение!
+                                if was_home_k2:
+                                    # К2 была ДОМА → берём 'home'
+                                    try:
+                                        value = float(str(stat['home']).rstrip('%'))
+                                        found = True
+                                    except:
+                                        pass
+                                else:
+                                    # К2 была В ГОСТЯХ → берём 'away'
+                                    try:
+                                        value = float(str(stat['away']).rstrip('%'))
+                                        found = True
+                                    except:
+                                        pass
+                                break
+
+                        if found:
+                            break
+
+                    entry_widget.delete(0, tk.END)
+                    entry_widget.insert(0, f"{value:.1f}")
+                    print(f"    {field_name}: {value}")
+
+            print(f"\n{'=' * 70}")
+            print(f"✅ ТАБЛИЦА ЗАПОЛНЕНА УСПЕШНО!")
+            print(f"{'=' * 70}\n")
+
+            messagebox.showinfo("Успех", "✅ Статистика загружена!\nДанные правильно определены по позициям команд.")
+
+        except Exception as e:
+            import traceback
+            print(f"\n❌ ERROR: {e}")
+            print(traceback.format_exc())
+            messagebox.showerror("Ошибка", f"Ошибка: {str(e)}")
+
+    def _collect_table_data(self, table_entries):
+        data = []
+        for row_widgets in table_entries:
+            row = {}
+            for field_name, entry_widget in row_widgets.items():
+                try:
+                    value = safe_float(entry_widget.get()) or 0.0
+                    row[field_name] = value
+                except:
+                    row[field_name] = 0.0
+            data.append(row)
+        return data
+
+    def _calculate_prediction(self):
+        try:
+            self._update_status("🎯 Расчет прогноза...")
+
+            team1_data = self._collect_table_data(self.team1_entries)
+            team2_data = self._collect_table_data(self.team2_entries)
+
+            if not team1_data or not team1_data[0].get('pos'):
+                messagebox.showwarning("Предупреждение", "Заполните таблицу")
+                return
+
+            xg1 = calculate_xg(team1_data, team2_data)
+            xg2 = calculate_xg(team2_data, team1_data)
+
+            p1, pd, p2 = compute_probs(xg1, xg2)
+
+            lines = [
+                "=" * 80,
+                "🏆 ПРОГНОЗ МАТЧА",
+                "=" * 80,
+                f"\n📊 ОЖИДАЕМЫЕ ГОЛЫ (XG):",
+                f"   К1 (Дома): {xg1:.2f}",
+                f"   К2 (Гости): {xg2:.2f}",
+                f"   Всего: {xg1 + xg2:.2f}",
+                f"\n🎯 ВЕРОЯТНОСТИ ИСХОДОВ:",
+                f"   П1 (Победа дома): {p1 * 100:.1f}%",
+                f"   X  (Ничья): {pd * 100:.1f}%",
+                f"   П2 (Победа гостей): {p2 * 100:.1f}%",
+            ]
+
+            pick = "П1" if p1 > p2 and p1 > pd else ("П2" if p2 > p1 and p2 > pd else "X")
+            lines.append(f"\n💡 РЕКОМЕНДАЦИЯ: {pick}")
+
+            lines.append(f"\n📅 {time.strftime('%d.%m.%Y %H:%M:%S')}")
+
+            result_text = "\n".join(lines)
+            self.forecast_text.configure(state="normal")
+            self.forecast_text.delete("1.0", tk.END)
+            self.forecast_text.insert("1.0", result_text)
+            self.forecast_text.configure(state="disabled")
+
+            self._update_status("✅ Прогноз рассчитан", "#00FF66")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def _save_report(self):
+        forecast_text = self.forecast_text.get("1.0", tk.END)
+        if not forecast_text.strip():
+            messagebox.showwarning("Предупреждение", "Нет данных")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            initialfile=f"Прогноз_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(forecast_text)
+                messagebox.showinfo("Успех", f"Сохранено: {path}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+
+if __name__ == "__main__":
+    if not PLAYWRIGHT_AVAILABLE:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Ошибка",
+                             "Playwright не установлен!\n"
+                             "pip install playwright\n"
+                             "playwright install chromium")
+        root.destroy()
+    else:
+        app = XGPredictorFinal()
+        app.mainloop()
